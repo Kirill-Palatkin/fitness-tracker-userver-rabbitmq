@@ -1,10 +1,14 @@
 #include "fitness_tracker.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <regex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include <fmt/format.h>
 
@@ -82,6 +86,114 @@ std::string MakeOpaqueToken() {
 std::string HashPassword(std::string_view password, std::string_view salt) {
   return userver::crypto::hash::Blake2b128(
       fmt::format("{}:{}", salt, password));
+}
+
+struct CacheEntry {
+  std::string body;
+  std::chrono::steady_clock::time_point expires_at;
+};
+
+struct RateLimitBucket {
+  int count{};
+  std::chrono::steady_clock::time_point window_start{};
+};
+
+struct RateLimitDecision {
+  bool allowed{};
+  int limit{};
+  int remaining{};
+  std::int64_t reset_after_seconds{};
+};
+
+class PerformanceState final {
+ public:
+  std::optional<std::string> GetCachedResponse(std::string_view key) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex_);
+    const auto it = cache_.find(std::string(key));
+    if (it == cache_.end()) {
+      return std::nullopt;
+    }
+    if (it->second.expires_at <= now) {
+      cache_.erase(it);
+      return std::nullopt;
+    }
+    return it->second.body;
+  }
+
+  void PutCachedResponse(std::string key, std::string body,
+                         std::chrono::seconds ttl) {
+    std::lock_guard lock(mutex_);
+    cache_[std::move(key)] = CacheEntry{
+        std::move(body), std::chrono::steady_clock::now() + ttl};
+  }
+
+  void InvalidateCache(std::string_view key) {
+    std::lock_guard lock(mutex_);
+    cache_.erase(std::string(key));
+  }
+
+  void InvalidateCachePrefix(std::string_view prefix) {
+    std::lock_guard lock(mutex_);
+    for (auto it = cache_.begin(); it != cache_.end();) {
+      if (it->first.compare(0, prefix.size(), prefix) == 0) {
+        it = cache_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  RateLimitDecision CheckRateLimit(std::string key, int limit,
+                                   std::chrono::seconds window) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex_);
+
+    auto& bucket = rate_limits_[std::move(key)];
+    if (bucket.window_start.time_since_epoch().count() == 0 ||
+        now - bucket.window_start >= window) {
+      bucket.window_start = now;
+      bucket.count = 0;
+    }
+
+    const bool allowed = bucket.count < limit;
+    if (allowed) {
+      ++bucket.count;
+    }
+
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(now -
+                                                         bucket.window_start);
+    const auto reset_after =
+        std::chrono::duration_cast<std::chrono::seconds>(window - elapsed)
+            .count();
+
+    return RateLimitDecision{
+        allowed,
+        limit,
+        allowed ? limit - bucket.count : 0,
+        reset_after > 0 ? reset_after : 0,
+    };
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<std::string, CacheEntry> cache_;
+  std::unordered_map<std::string, RateLimitBucket> rate_limits_;
+};
+
+PerformanceState& GetPerformanceState() {
+  static PerformanceState state;
+  return state;
+}
+
+std::string MakeStatsCacheKey(std::int64_t user_id, std::string_view from,
+                              std::string_view to) {
+  return fmt::format("postgres:workout_stats:{}:{}:{}", user_id, from, to);
+}
+
+std::string MakeStatsCachePrefix(std::int64_t user_id) {
+  return fmt::format("postgres:workout_stats:{}:", user_id);
 }
 
 class ApiHandlerBase : public userver::server::handlers::HttpHandlerBase {
@@ -187,6 +299,33 @@ class ApiHandlerBase : public userver::server::handlers::HttpHandlerBase {
     response.SetStatus(status);
     response.SetContentType(userver::http::content_type::kApplicationJson);
     return formats_json::ToString(value);
+  }
+
+  std::string JsonTextResponse(const http::HttpRequest& request,
+                               std::string body,
+                               http::HttpStatus status =
+                                   http::HttpStatus::kOk) const {
+    auto& response = request.GetHttpResponse();
+    response.SetStatus(status);
+    response.SetContentType(userver::http::content_type::kApplicationJson);
+    return body;
+  }
+
+  void SetCacheHeader(const http::HttpRequest& request,
+                      std::string_view value) const {
+    request.GetHttpResponse().SetHeader(std::string("X-Cache"),
+                                         std::string(value));
+  }
+
+  void SetRateLimitHeaders(const http::HttpRequest& request,
+                           const RateLimitDecision& decision) const {
+    auto& response = request.GetHttpResponse();
+    response.SetHeader(std::string("X-RateLimit-Limit"),
+                       std::to_string(decision.limit));
+    response.SetHeader(std::string("X-RateLimit-Remaining"),
+                       std::to_string(decision.remaining));
+    response.SetHeader(std::string("X-RateLimit-Reset"),
+                       std::to_string(decision.reset_after_seconds));
   }
 
   std::string JsonResponse(const http::HttpRequest& request,
@@ -351,6 +490,14 @@ class LoginHandler final : public ApiHandlerBase {
       const auto login = GetRequiredStringField(json, "login");
       const auto password = GetRequiredStringField(json, "password");
 
+      const auto rate_limit = GetPerformanceState().CheckRateLimit(
+          "login:" + login, 5, std::chrono::seconds{60});
+      SetRateLimitHeaders(request, rate_limit);
+      if (!rate_limit.allowed) {
+        throw ApiException(http::HttpStatus::kTooManyRequests, "rate_limited",
+                           "Слишком много попыток входа. Повторите запрос позже");
+      }
+
       const auto result = GetPgCluster()->Execute(
           pg::ClusterHostType::kMaster,
           "SELECT id, login, first_name, last_name, password_salt, "
@@ -507,6 +654,7 @@ class ExerciseCreateHandler final : public ApiHandlerBase {
       exercise["calories_per_minute"] = calories_per_minute;
       exercise["description"] = description;
       exercise["created_by"] = auth_user.id;
+      GetPerformanceState().InvalidateCache("postgres:exercises:list");
       return JsonResponse(request, exercise, http::HttpStatus::kCreated);
     });
   }
@@ -522,6 +670,13 @@ class ExerciseListHandler final : public ApiHandlerBase {
       const http::HttpRequest& request,
       userver::server::request::RequestContext&) const override {
     return ExecuteSafely(request, [&] {
+      constexpr std::string_view kCacheKey = "postgres:exercises:list";
+      if (const auto cached =
+              GetPerformanceState().GetCachedResponse(kCacheKey)) {
+        SetCacheHeader(request, "HIT");
+        return JsonTextResponse(request, *cached);
+      }
+
       const auto result = GetPgCluster()->Execute(
           pg::ClusterHostType::kMaster,
           "SELECT id, name, muscle_group, calories_per_minute, "
@@ -549,7 +704,11 @@ class ExerciseListHandler final : public ApiHandlerBase {
 
       formats_json::ValueBuilder builder;
       builder["exercises"] = exercises.ExtractValue();
-      return JsonResponse(request, builder);
+      const auto body = formats_json::ToString(builder.ExtractValue());
+      GetPerformanceState().PutCachedResponse(std::string(kCacheKey), body,
+                                              std::chrono::seconds{60});
+      SetCacheHeader(request, "MISS");
+      return JsonTextResponse(request, body);
     });
   }
 };
@@ -662,6 +821,8 @@ class WorkoutCreateHandler final : public ApiHandlerBase {
       builder["title"] = row["title"].As<std::string>();
       builder["planned_date"] = row["planned_date"].As<std::string>();
       builder["notes"] = row["notes"].As<std::string>();
+      GetPerformanceState().InvalidateCachePrefix(
+          MakeStatsCachePrefix(auth_user.id));
       return JsonResponse(request, builder, http::HttpStatus::kCreated);
     });
   }
@@ -710,6 +871,8 @@ class WorkoutExerciseAddHandler final : public ApiHandlerBase {
       builder["sets"] = sets;
       builder["reps"] = reps;
       builder["duration_minutes"] = duration_minutes;
+      GetPerformanceState().InvalidateCachePrefix(
+          MakeStatsCachePrefix(auth_user.id));
       return JsonResponse(request, builder, http::HttpStatus::kCreated);
     });
   }
@@ -848,6 +1011,13 @@ class WorkoutStatsHandler final : public ApiHandlerBase {
       ValidateDate(from, "from");
       ValidateDate(to, "to");
 
+      const auto cache_key = MakeStatsCacheKey(auth_user.id, from, to);
+      if (const auto cached =
+              GetPerformanceState().GetCachedResponse(cache_key)) {
+        SetCacheHeader(request, "HIT");
+        return JsonTextResponse(request, *cached);
+      }
+
       const auto result = GetPgCluster()->Execute(
           pg::ClusterHostType::kMaster,
           "SELECT "
@@ -874,7 +1044,11 @@ class WorkoutStatsHandler final : public ApiHandlerBase {
       builder["total_exercise_minutes"] =
           row["total_minutes"].As<std::int64_t>();
       builder["total_calories_burned"] = row["total_calories"].As<double>();
-      return JsonResponse(request, builder);
+      const auto body = formats_json::ToString(builder.ExtractValue());
+      GetPerformanceState().PutCachedResponse(cache_key, body,
+                                              std::chrono::seconds{30});
+      SetCacheHeader(request, "MISS");
+      return JsonTextResponse(request, body);
     });
   }
 };

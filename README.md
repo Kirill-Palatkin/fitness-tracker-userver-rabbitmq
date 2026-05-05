@@ -40,6 +40,7 @@ docker compose up --build
 - `data.js` - тестовые данные MongoDB
 - `queries.js` - CRUD-запросы и aggregation pipeline для MongoDB
 - `validation.js` - создание коллекций, индексов и `$jsonSchema`-валидации MongoDB
+- `performance_design.md` - стратегия кеширования, rate limiting и анализ производительности
 
 ## Схема базы данных
 
@@ -101,6 +102,22 @@ docker compose exec -T mongo mongosh fitness_tracker_mongo < queries.js
 ```powershell
 Get-Content .\queries.js | docker compose exec -T mongo mongosh fitness_tracker_mongo
 ```
+
+## Кеширование и rate limiting
+
+В API реализовано in-memory кеширование для:
+
+- `GET /v1/exercises`
+- `GET /v1/workouts/statistics`
+
+Ответы кешируемых эндпоинтов содержат заголовок `X-Cache` со значением `MISS` или `HIT`.
+
+Кеш инвалидируется при изменении связанных данных:
+
+- `POST /v1/exercises` сбрасывает кеш списка упражнений
+- `POST /v1/workouts` и `POST /v1/workouts/{workout_id}/exercises` сбрасывают кеш статистики текущего пользователя
+
+Для `POST /v1/auth/login` реализован rate limiting: 5 попыток входа в минуту на один логин. При превышении лимита возвращается `429 Too Many Requests`, в ответ добавляются заголовки `X-RateLimit-Limit`, `X-RateLimit-Remaining` и `X-RateLimit-Reset`.
 
 ## Пример сценария работы
 
