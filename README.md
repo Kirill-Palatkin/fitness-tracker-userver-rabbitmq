@@ -207,3 +207,46 @@ curl -X POST http://localhost:8080/v1/mongo/exercises \
 ## OpenAPI
 
 Контракт API описан в `openapi.yaml`.
+
+## Event-Driven архитектура
+
+Добавлена Event-Driven часть на RabbitMQ.
+
+Файлы:
+
+- `event_driven_design.md` - описание Event-Driven архитектуры, потоков событий, RabbitMQ и CQRS
+- `event_catalog.md` - каталог событий
+- `events/producer.py` - демонстрационный producer событий
+- `events/consumer.py` - consumer событий
+
+RabbitMQ запускается через Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+RabbitMQ доступен по адресу:
+
+```text
+http://localhost:15672
+```
+
+Логин и пароль:
+
+```text
+guest / guest
+```
+
+Проверить публикацию событий:
+
+```bash
+docker compose run --rm event-producer
+```
+
+Посмотреть, что consumer получил события:
+
+```bash
+docker compose logs -f event-consumer
+```
+
+Используется exchange `fitness_tracker.events` типа `topic`. Основные события: `UserRegistered`, `ExerciseCreated`, `WorkoutCreated`, `ExerciseAddedToWorkout`.

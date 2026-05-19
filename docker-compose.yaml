@@ -33,12 +33,57 @@ services:
       - ./validation.js:/docker-entrypoint-initdb.d/01-validation.js:ro
       - ./data.js:/docker-entrypoint-initdb.d/02-data.js:ro
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  event-consumer:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./events:/app:ro
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: fitness_tracker.events
+      RABBITMQ_QUEUE: fitness_tracker.audit
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python consumer.py"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  event-producer:
+    image: python:3.12-slim
+    profiles:
+      - events
+    working_dir: /app
+    volumes:
+      - ./events:/app:ro
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: fitness_tracker.events
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python producer.py"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
   api:
     build: .
     depends_on:
       postgres:
         condition: service_healthy
       mongo:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     environment:
       DB_CONNECTION: postgresql://fitness_tracker_user:password@postgres:5432/fitness_tracker_service_db_1
