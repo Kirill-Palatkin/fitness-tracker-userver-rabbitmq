@@ -225,7 +225,7 @@ RabbitMQ запускается через Docker Compose:
 docker compose up --build
 ```
 
-RabbitMQ доступен по адресу:
+Доступен по адресу:
 
 ```text
 http://localhost:15672
